@@ -17,12 +17,14 @@ unknown**, rather than as free space.
 IRIS is **training-free**. It composes open-weight models; no component is
 fine-tuned, and there are no runtime API calls.
 
-![Occlusion graph and peel order](docs/images/occlusion_graph.png)
+![IRIS pipeline overview](docs/images/pipeline.png)
 
-*The occlusion graph IRIS builds for one scene. An arrow A→B means A occludes B and
-must be peeled first; the node numbers are the resulting order. Edges come from
-comparing depth in the contact band where two masks meet, with a physical-support
-tie-break when depth is inconclusive.*
+*Overview. A vision-language model discovers the objects and a grounded segmenter
+produces per-instance masks, while a monocular depth model estimates relative depth.
+CORe — the contact-band occlusion reasoning module — builds an occlusion graph over
+the instances and topologically sorts it into a peel order. Each peel yields an
+amodal 3D object and a new same-pose view; the view stack drives multi-view
+reconstruction, then gravity/yaw alignment and registration.*
 
 ```
 RGB image
@@ -39,7 +41,15 @@ RGB image
    └─ free / occupied / occluded occupancy grid
 ```
 
-### Why the peel order matters
+### CORe: ordering by contact-band occlusion reasoning
+
+![Occlusion graph and peel order](docs/images/occlusion_graph.png)
+
+*The occlusion graph for one scene. An arrow A→B means A occludes B and must be
+peeled first; node numbers give the resulting order. Edges come from comparing depth
+in the contact band where two masks meet, with a physical-support tie-break when
+depth is inconclusive.*
+
 
 Peeling is only sound if an occluder is removed *before* whatever it hides. Get that
 wrong and the inpainter paints over geometry that is still covered, and the crop
@@ -65,6 +75,7 @@ Full technical breakdown: [docs/architecture.md](docs/architecture.md).
 - [Quickstart](#quickstart)
 - [Usage](#usage)
 - [Outputs](#outputs)
+- [Qualitative comparison](#qualitative-comparison)
 - [Reproducing the benchmarks](#reproducing-the-benchmarks)
 - [Configuration](#configuration)
 - [Repository layout](#repository-layout)
@@ -182,22 +193,22 @@ Written to `--output_dir`:
 | `synthetic_views/` | The peeled same-pose view stack |
 | `object_crops/` | De-occluded crops fed to image-to-3D |
 
-Two of those outputs are worth showing directly. The occupancy grid separates space
-the camera actually saw from space it could not, instead of treating unseen volume as
-empty:
+One of those is worth showing directly. The occupancy grid separates space the camera
+actually saw from space it could not, instead of treating unseen volume as empty:
 
 ![Occupancy slices](docs/images/occupancy_slices.png)
 
 *Orthogonal slices through the occupancy grid. Volume hidden behind a surface is
 labelled occluded, not free.*
 
-And the fused mesh can be viewed from angles the camera never occupied:
+## Qualitative comparison
 
-![Reconstruction](docs/images/reconstruction.png)
+![Qualitative comparison](docs/images/comparison.png)
 
-*Left: the single input photograph. Right: the fused mesh rendered from two novel
-viewpoints. Each object is a closed volume — the peeled crops let image-to-3D
-complete the back and sides, which no pixel of the input observed.*
+*Comparison on 3D-FRONT and real-world images against Gen3DSR (3DV'25),
+DreamGaussian (ICLR'24), CAST (SIGGRAPH'25), IVID (ICCV'23) and CUPID (CVPR'26).
+IRIS recovers both foreground objects and background geometry, where methods that
+reconstruct objects in isolation leave the scene incomplete.*
 
 ## Reproducing the benchmarks
 
