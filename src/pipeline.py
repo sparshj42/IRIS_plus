@@ -7,12 +7,13 @@ IRIS: Iterative Reconstruction via Incremental Scene-peeling
               - object removal revealing what's behind   (RORem)
   Phase B2: Image-to-3D (deferred)      (Amodal3R / TRELLIS; skip with --skip_3d)
   Phase C : Scene Reconstruction        (VGGT on same-pose synthetic views)
-  Phase D : Rigid Registration + Fusion (mask-guided init + ICP, Open3D)
-  Phase E : Semantic Labeling           (Mask2Former, multi-view voting)
-  Phase F : Mesh Generation             (Marching Cubes)
-  Phase G : Occupancy                   (free / occupied / occluded ray-cast)
+  Phase D : Rigid Registration + Fusion (mask-guided init + ICP; objects = observed
+                                         front + Amodal3R back, background = final
+                                         peeled view, plane-filled)
+  Phase F : Mesh Generation             (per-object NKSR + plane-filled NKSR background,
+                                         true colour; Poisson fallback)
 
-Models are loaded/freed in phases. Image-to-3D runs in a pinned-env subprocess worker.
+Models are loaded/freed in phases. Image-to-3D and NKSR run in pinned-env subprocess workers.
 """
 
 import argparse
@@ -24,7 +25,7 @@ import sys
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 # Cap CPU thread fan-out BEFORE numpy/Open3D import: Open3D/MKL/OpenBLAS otherwise
 # each spawn ~one thread per core (e.g. 224 on a big box), oversubscribing and
-# stalling the CPU-heavy phases (registration, meshing, occupancy). A modest cap is
+# stalling the CPU-heavy phases (registration, meshing). A modest cap is
 # plenty here (the models run on GPU; CPU isn't the bottleneck). Override by
 # exporting these vars yourself.
 _NT = str(min(16, os.cpu_count() or 16))
@@ -116,84 +117,6 @@ ROREM_PROMPT = "4K, high quality, masterpiece, Highly detailed, Sharp focus, Pro
 ROREM_NEG_PROMPT = "low quality, worst, bad proportions, blurry, extra finger, Deformed, disfigured, unclear background"
 
 VGGT_CONF_THRESHOLD = 0.5
-
-# Semantic taxonomy. Phase E labels OBJECTS from the SAM3 instance masks + VLM
-# names (open-vocab, mapped down to these canonical classes) and BACKGROUND STUFF
-# (floor/wall/ceiling/...) from Mask2Former — instead of collapsing every object
-# into "other". This set is our own choice; remap CLASS_COLORS / NAME_TO_CLASS /
-# ADE20K_TO_IRIS to a fixed benchmark taxonomy (ScanNet-20, S3DIS-13) when grading.
-CLASS_COLORS = {                       # name -> RGB (0-1)
-    "floor":   [0.55, 0.40, 0.22],     # brown
-    "wall":    [0.80, 0.80, 0.80],     # light gray
-    "ceiling": [0.90, 0.90, 0.70],     # pale yellow
-    "window":  [0.60, 0.85, 0.95],     # pale cyan
-    "curtain": [0.70, 0.55, 0.85],     # lavender
-    "door":    [0.50, 0.35, 0.25],     # dark brown
-    "chair":   [0.90, 0.20, 0.20],     # red
-    "table":   [0.20, 0.45, 0.90],     # blue
-    "sofa":    [0.95, 0.45, 0.75],     # pink
-    "bed":     [0.55, 0.25, 0.60],     # purple
-    "cabinet": [0.85, 0.55, 0.20],     # orange
-    "shelf":   [0.95, 0.80, 0.25],     # gold
-    "screen":  [0.10, 0.70, 0.70],     # teal  (monitor/tv/laptop/phone)
-    "book":    [0.95, 0.35, 0.10],     # vermilion (book/folder/paper)
-    "box":     [0.40, 0.26, 0.13],     # umber
-    "bottle":  [0.20, 0.80, 0.40],     # green
-    "lamp":    [1.00, 0.95, 0.55],     # bright yellow
-    "bag":     [0.45, 0.30, 0.65],     # indigo
-    "appliance": [0.30, 0.55, 0.55],   # slate
-    "plant":   [0.25, 0.65, 0.25],     # leaf green
-    "tool":    [0.95, 0.75, 0.10],     # amber (hammer/screwdriver/wrench/...)
-    "other":   [0.55, 0.55, 0.55],     # neutral gray
-}
-IRIS_CLASSES = list(CLASS_COLORS.keys())
-IRIS_LABEL_TO_ID = {n: i for i, n in enumerate(IRIS_CLASSES)}
-LABEL_COLORS = {i: CLASS_COLORS[n] for n, i in IRIS_LABEL_TO_ID.items()}
-
-# ADE20K (Mask2Former) ids -> our STUFF classes only. Objects come from instances,
-# not from ADE, so we deliberately map only background structure here.
-ADE20K_TO_IRIS = {
-    0: "wall", 1: "wall",
-    3: "floor", 28: "floor", 54: "floor", 78: "floor",
-    5: "ceiling",
-    8: "window",
-    18: "curtain",
-    14: "door",
-}
-
-# VLM open-vocab name -> canonical class, by keyword (first match wins). Order
-# matters: more specific words before generic ones.
-_NAME_RULES = [
-    (("ceiling",), "ceiling"), (("floor", "rug", "carpet"), "floor"),
-    (("curtain", "drape", "blind"), "curtain"), (("window",), "window"),
-    (("door",), "door"), (("wall",), "wall"),
-    (("office chair", "chair", "stool", "seat"), "chair"),
-    (("desk", "table", "platform", "counter"), "table"),
-    (("sofa", "couch"), "sofa"), (("bed", "mattress"), "bed"),
-    (("bookshelf", "bookcase", "shelf", "rack"), "shelf"),
-    (("cabinet", "drawer", "nightstand", "wardrobe", "dresser"), "cabinet"),
-    (("monitor", "screen", "tv", "television", "laptop", "computer", "phone",
-      "mouse", "keyboard", "remote", "speaker", "tablet"), "screen"),
-    (("book", "folder", "paper", "magazine", "notebook", "document"), "book"),
-    (("box", "carton", "case", "toolbox", "container"), "box"),
-    (("bottle", "cup", "mug", "glass", "can", "jar", "vase"), "bottle"),
-    (("lamp", "light"), "lamp"),
-    (("bag", "backpack", "purse", "cloth", "towel"), "bag"),
-    (("hammer", "screwdriver", "wrench", "drill", "plier", "saw", "spanner",
-      "knife", "scissor", "tool"), "tool"),
-    (("plant", "flower", "tree"), "plant"),
-    (("fridge", "microwave", "oven", "fan", "heater", "appliance",
-      "printer", "machine"), "appliance"),
-]
-
-
-def name_to_class(name: str) -> str:
-    n = name.lower()
-    for keys, cls in _NAME_RULES:
-        if any(k in n for k in keys):
-            return cls
-    return "other"
-
 
 def free_cuda(*objs):
     for o in objs:
@@ -313,7 +236,12 @@ step0 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "step0_vlm.py")
 
 def _freest_gpu():
     """Pick the GPU with the most free memory, so the big VLM lands on a clear
-    card (this box has 8×H100; GPU 0 may be shared with other processes)."""
+    card (this box has 8×H100; GPU 0 may be shared with other processes).
+    If the caller pinned CUDA_VISIBLE_DEVICES, respect it — otherwise parallel
+    runs would all auto-pick the same 'freest' card and collide on the 62 GB VLM."""
+    pinned = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if pinned not in (None, ""):
+        return pinned
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"], text=True)
@@ -778,11 +706,28 @@ else:
         for inst in instances:
             mb = inst["mask"] > 0.5
             inst["nearest"] = depth_map[mb].max() if mb.sum() > 0 else -np.inf
-        sorted_instances = build_occlusion_order(instances, depth_map)
-
-        print("Peeling order (occlusion graph + topological sort, front first):")
+        if os.environ.get("IRIS_PEEL_ORDER") == "naive":
+            # ABLATION (paper): the pre-occlusion-graph baseline. Peel strictly by
+            # each object's single nearest pixel (max disparity) first — no pairwise
+            # occlusion graph, no topological sort. An object that is globally behind
+            # but happens to have one near pixel gets peeled before its occluder, so
+            # RORem inpaints over geometry that is still covered → peel artifacts.
+            sorted_instances = sorted(instances, key=lambda inst: inst["nearest"], reverse=True)
+            print("Peeling order (ABLATION: naive nearest-depth, NO topological sort):")
+        else:
+            sorted_instances = build_occlusion_order(instances, depth_map)
+            print("Peeling order (occlusion graph + topological sort, front first):")
         for i, inst in enumerate(sorted_instances, 1):
             print(f"  {i}. {inst['uid']} (nearest-point disparity: {inst['nearest']:.3f})")
+
+        if os.environ.get("IRIS_DUMP_INSTANCES") and img_idx == 0:
+            # paper figure: the ORIGINAL pre-peel instance masks (all objects present,
+            # properly occluding) + depth — the exact inputs to build_occlusion_order.
+            pickle.dump([{"uid": x["uid"], "mask": x["mask"]} for x in instances],
+                        open(os.path.join(OUTPUT_DIR, "instances_orig.pkl"), "wb"))
+            print(f"  [dump] {len(instances)} original instance masks -> instances_orig.pkl")
+            if os.environ.get("IRIS_DUMP_EXIT"):
+                sys.exit(0)
 
         # ── Iterative occlusion peeling ──────────────────────────────────────
         print("\nIterative occlusion peeling...")
@@ -821,8 +766,9 @@ else:
                 mask = inst["mask"]
                 print("    Re-detection mismatch; using initial mask")
 
-            # Always record the instance mask (uid + view + mask) — Phase E uses it
-            # to label points by object. The crop / image-to-3D work stays gated.
+            # Always record the instance mask (uid + view + mask) — registration
+            # (Phase D) uses it to find each object's observed points. The crop /
+            # image-to-3D work stays gated.
             record_mask = (mask > 0.5).astype(np.uint8)
             if not args.skip_3d:
                 crop, crop_mask = build_object_crop(current_image, mask)
@@ -870,7 +816,7 @@ if args.stop_after_peeling:
 # ═══════════════════════════════════════════════════════════════════════════════
 if not args.skip_3d:
     # records without a saved crop (object too small to crop) carry no image-to-3D;
-    # they still get an instance mask for Phase E labeling, just skip them here.
+    # they still get an instance mask for registration, just skip them here.
     need = [i for i, rec in enumerate(object_records) if rec[3] is None
             and os.path.exists(os.path.join(CROPS_DIR, f"{i:02d}.png"))]
     if need:
@@ -909,6 +855,7 @@ if args.resume and os.path.exists(PM_PATH) and "extrinsics" in np.load(PM_PATH, 
     world_points, conf = data["world_points"], data["conf"]
     extrinsics, intrinsics = data["extrinsics"], data["intrinsics"]
     view_paths = [str(p) for p in data["view_paths"]]
+    images_rgb = data["images_rgb"] if "images_rgb" in data else None   # (V,Hv,Wv,3) in [0,1]
     print(f"[resume] Loaded VGGT point maps: {world_points.shape}")
 else:
     from vggt.models.vggt import VGGT
@@ -922,7 +869,9 @@ else:
 
     world_points = predictions["world_points"].squeeze(0).cpu().float().numpy()   # (V, Hv, Wv, 3)
     conf = predictions["world_points_conf"].squeeze(0).cpu().float().numpy()      # (V, Hv, Wv)
-    # camera poses (for occupancy ray-casting in Phase G)
+    # true per-pixel RGB, pixel-aligned with world_points (ToTensor → [0,1]) for photometric mesh colour
+    images_rgb = images_t.permute(0, 2, 3, 1).cpu().float().numpy()               # (V, Hv, Wv, 3)
+    # camera poses (for the background plane-fill ray-cast)
     extri, intri = pose_encoding_to_extri_intri(predictions["pose_enc"], images_t.shape[-2:])
     extrinsics = extri.squeeze(0).cpu().float().numpy()   # (V, 3, 4) world-to-camera
     intrinsics = intri.squeeze(0).cpu().float().numpy()   # (V, 3, 3)
@@ -941,12 +890,19 @@ else:
     print(f"VGGT point maps: {world_points.shape}")
     np.savez_compressed(PM_PATH, world_points=world_points, conf=conf,
                         extrinsics=extrinsics, intrinsics=intrinsics,
-                        metric_scale=metric_scale, view_paths=np.array(view_paths))
+                        metric_scale=metric_scale, view_paths=np.array(view_paths),
+                        images_rgb=images_rgb)
     free_cuda(vggt, images_t, predictions)
 
 V, Hv, Wv = conf.shape
 scene_mask = conf > VGGT_CONF_THRESHOLD
 scene_pc = world_points[scene_mask]
+# true per-view colour, pixel-aligned with world_points (fallback: reload+resize raw
+# views for old checkpoints). Used to colour the fused cloud / mesh photometrically.
+if images_rgb is None:
+    images_rgb = np.stack([
+        np.asarray(Image.open(p).convert("RGB").resize((Wv, Hv), Image.BILINEAR), np.float32) / 255.0
+        for p in view_paths])
 print(f"Scene point cloud: {scene_pc.shape}")
 np.save(os.path.join(OUTPUT_DIR, "scene_pointcloud.npy"), scene_pc)
 
@@ -1091,35 +1047,99 @@ def register_object(obj_pc: np.ndarray, target_pts: np.ndarray,
         top_h, base_h = np.percentile(h, 98), np.percentile(h, 2)
         height = top_h - base_h
         gap = base_h - floor_h
-        if height > 1e-6 and 0 < gap < 0.6 * height:      # floating just above floor
+        # Only seat to the support surface if the object was actually OBSERVED resting
+        # near it. Objects seen well above the floor (a ceiling chandelier, wall-mounted
+        # or shelved items) must NOT be dragged down — the floor-contact stretch is for
+        # objects that genuinely sit on the floor/table.
+        obs_above = float(np.percentile(target_pts @ scene_up, 2)) - floor_h
+        on_floor = obs_above < max(0.5 * height, 0.05 * scene_diag)
+        if on_floor and height > 1e-6 and 0 < gap < 0.6 * height:   # floating just above support
             factor = (top_h - floor_h) / (top_h - base_h)
             new_h = top_h - (top_h - h) * factor
             aligned = aligned + (new_h - h)[:, None] * scene_up
             print(f"    floor contact: stretched base to floor (gap {gap/scene_diag:.4f} → 0)")
+        elif not on_floor:
+            print(f"    floor contact: skipped (observed {obs_above/scene_diag:.3f} above floor — not a floor object)")
 
     print(f"    fit-to-segment: weld residual {best[0] / scene_diag:.4f} (scene-rel)")
     return aligned
 
 
+def plane_fill_bg(P, conf_mask, haze, rgb, K, ext, scene_diag):
+    """Clean flat background = haze-excluded In view + plane-filled object footprints.
+
+    The inpainted footprint regions in the final peeled view are 'mound' geometry
+    (haze) — we drop them, fit the table + wall planes by RANSAC, and fill each
+    footprint pixel by casting its camera ray onto the NEARER plane (table for open
+    table, wall for behind tall objects). A flat continuation: no inpaint mounds, no
+    tent ridges, no holes. Returns (xyz, rgb) in the same (gravity) frame as P."""
+    from scipy.spatial import cKDTree as _ck
+    valid = conf_mask & ~haze
+    real_xyz, real_rgb = P[valid], rgb[valid]
+    pc = o3d.geometry.PointCloud(); pc.points = o3d.utility.Vector3dVector(real_xyz)
+    try:
+        tm, ti = pc.segment_plane(0.006 * scene_diag, 3, 1000)          # table (largest)
+        wm, _wi = pc.select_by_index(ti, invert=True).segment_plane(0.006 * scene_diag, 3, 1000)  # wall
+    except Exception:
+        return real_xyz, real_rgb
+    hy, hx = np.where(haze)
+    if len(hy) == 0:
+        return real_xyz, real_rgb
+    Kinv = np.linalg.inv(K); Rc2w = ext[:, :3].T; C = -ext[:, :3].T @ ext[:, 3]
+    rw = (Rc2w @ (Kinv @ np.c_[hx + 0.5, hy + 0.5, np.ones(len(hx))].T)).T
+    rw /= np.linalg.norm(rw, axis=1, keepdims=True)
+    def isect(m):
+        n = m[:3]; den = rw @ n
+        s = (-m[3] - C @ n) / np.where(np.abs(den) < 1e-9, np.nan, den)
+        return np.where(s > 0, s, np.inf)
+    S = np.minimum(isect(tm), isect(wm)); good = np.isfinite(S)
+    if not good.any():
+        return real_xyz, real_rgb
+    fill = C + S[good, None] * rw[good]
+    fill_rgb = real_rgb[_ck(real_xyz).query(fill)[1]]
+    print(f"  plane-fill: {len(real_xyz)} real + {int(good.sum())} footprint-fill pts")
+    return np.vstack([real_xyz, fill]), np.vstack([real_rgb, fill_rgb])
+
+
 FUSED_PATH = os.path.join(OUTPUT_DIR, "fused_pointcloud.npy")
+FUSED_RGB_PATH = os.path.join(OUTPUT_DIR, "fused_pointcloud_rgb.npy")
 OBJECTS_PATH = os.path.join(OUTPUT_DIR, "registered_objects.pkl")
 if args.resume and os.path.exists(FUSED_PATH) and os.path.getmtime(FUSED_PATH) > os.path.getmtime(PM_PATH):
     fused_pc = np.load(FUSED_PATH)
+    fused_rgb = np.load(FUSED_RGB_PATH) if os.path.exists(FUSED_RGB_PATH) else np.full_like(fused_pc, 0.6)
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(fused_pc)
     registered_objects = pickle.load(open(OBJECTS_PATH, "rb")) if os.path.exists(OBJECTS_PATH) else []
+    colored_objects = []   # not cached on resume → Phase F falls back to registered_objects
+    bg_inview = None; bg_inview_rgb = None   # not cached → Phase F falls back to fused-minus-objects
     print(f"[resume] Loaded fused point cloud: {fused_pc.shape}")
 else:
-    fused = [scene_pc]
-    registered_objects = []   # per-object registered clouds, for occupancy solidification
+    registered_objects = []   # per-object registered clouds (observed front + Amodal3R back)
     colored_objects = []      # (placed xyz, rgb) per object → colored objects-only mesh
     scene_up, floor_h = scene_up_vector(scene_pc)
     print(f"  scene up (floor normal): {np.round(scene_up, 3)}, floor_h {floor_h:.3f}")
+
+    # ── Background = the FINAL fully-peeled view, minus object footprints ───────
+    # The last synthetic view has every object removed, so its VGGT reconstruction
+    # is the background table/wall. BUT behind each object that region was RORem-
+    # inpainted (colour ghosts / "haze"), which VGGT turns into floating geometry
+    # between objects. Drop those object-footprint pixels (dilated for the halo) —
+    # they're occluded by the objects anyway, which sit back on top of the holes.
+    haze = np.zeros((Hv, Wv), bool)
+    for _on, _vi, _m, _pc in object_records:
+        haze |= cv2.resize(_m, (Wv, Hv), interpolation=cv2.INTER_NEAREST) > 0.5
+    haze = cv2.dilate(haze.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+    bg_mask = scene_mask[-1] & ~haze
+    fused = [world_points[-1][bg_mask]]
+    fused_colors = [images_rgb[-1][bg_mask]]
+    print(f"  background from final peeled view: {int(bg_mask.sum())} pts")
+
     for obj_name, view_idx, mask, obj_pc in object_records:
         print(f"\n  Registering: {obj_name} (view {view_idx})")
         mask_v = cv2.resize(mask, (Wv, Hv), interpolation=cv2.INTER_NEAREST) > 0.5
         valid = mask_v & scene_mask[view_idx]
         target_pts = world_points[view_idx][valid]
+        target_rgb = images_rgb[view_idx][valid]
         if len(target_pts) < 50:
             print(f"    Only {len(target_pts)} mask points in scene, skipping")
             continue
@@ -1139,23 +1159,29 @@ else:
         # OBJECT-relative threshold: a scene-relative one is larger than a small
         # object when a big floor inflates scene_diag, rejecting the whole completion.
         obj_diag = float(np.linalg.norm(aligned.max(0) - aligned.min(0))) + 1e-9
-        new_pts = aligned[d_obs > 0.03 * obj_diag]
+        m_new = d_obs > 0.03 * obj_diag
+        new_pts = aligned[m_new]
+        new_rgb = obj_rgb[m_new] if obj_rgb is not None else np.full((int(m_new.sum()), 3), 0.6)
         placed = np.concatenate([target_pts, new_pts], axis=0)
         print(f"    kept {len(target_pts)} observed + grafted {len(new_pts)} generated")
-        fused.append(new_pts)          # scene_pc already holds the observed front
+        # object = real observed front (added explicitly; the background no longer
+        # carries it) + Amodal3R-generated occluded back
+        fused.append(target_pts);  fused_colors.append(target_rgb)
+        fused.append(new_pts);     fused_colors.append(np.clip(new_rgb, 0, 1))
         registered_objects.append(placed)
 
-    with open(OBJECTS_PATH, "wb") as f:
-        pickle.dump(registered_objects, f)
     fused_pc = np.concatenate(fused, axis=0)
+    fused_rgb = np.concatenate(fused_colors, axis=0)
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(fused_pc)
+    pcd.colors = o3d.utility.Vector3dVector(fused_rgb)   # carry RGB through downsample/denoise (o3d averages colours)
     pcd = pcd.voxel_down_sample(voxel_size=0.005 * scene_diag)
     # denoise: drop floaters (VGGT depth noise + per-view background ghosting) that
-    # would otherwise become spurious blobs in the marching-cubes mesh / occupancy.
+    # would otherwise become spurious blobs in the mesh.
     n_before = len(pcd.points)
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
     fused_pc = np.asarray(pcd.points)
+    fused_rgb = np.asarray(pcd.colors)                  # stays aligned with fused_pc
     print(f"\nFused point cloud (downsampled + denoised): {fused_pc.shape} "
           f"(removed {n_before - len(fused_pc)} outliers)")
 
@@ -1163,7 +1189,7 @@ else:
     # VGGT's world frame is arbitrary (often tilted ~45°), so the output looks
     # tilted / objects look "floating" in a viewer even when registration is
     # correct. Rotate everything so the estimated floor normal (scene_up) points
-    # up (+Y). Camera extrinsics rotate too so Phase G occupancy stays valid.
+    # up (+Y). Camera extrinsics rotate too so the background plane-fill ray-cast stays valid.
     def _R_to(a, b):
         a = a / (np.linalg.norm(a) + 1e-9); b = b / (np.linalg.norm(b) + 1e-9)
         v = np.cross(a, b); s = float(np.linalg.norm(v)); c = float(a @ b)
@@ -1174,13 +1200,26 @@ else:
     R_g = _R_to(np.asarray(scene_up, float), np.array([0.0, 1.0, 0.0]))
     fused_pc = fused_pc @ R_g.T
     registered_objects = [np.asarray(o) @ R_g.T for o in registered_objects]
-    world_points = world_points @ R_g.T                       # for Phase E/G
+    # pure per-object Amodal3R clouds (no observed-front graft → no seam) in the
+    # gravity frame, for clean per-object meshing in Phase F
+    colored_objects = [(np.asarray(a) @ R_g.T, np.asarray(c)) for a, c in colored_objects]
+    world_points = world_points @ R_g.T                       # for the background plane-fill
     extrinsics = np.asarray(extrinsics, float).copy()
     extrinsics[:, :, :3] = extrinsics[:, :, :3] @ R_g.T       # world2cam rot
+    # clean flat background: haze-excluded In view + plane-filled footprints (table/
+    # wall planes), so no inpaint mounds, no holes. Same gravity frame as the objects.
+    bg_inview, bg_inview_rgb = plane_fill_bg(
+        world_points[-1], scene_mask[-1], haze, images_rgb[-1],
+        intrinsics[-1], extrinsics[-1], scene_diag)
     print(f"  gravity-aligned output (scene_up {np.round(scene_up,2)} -> +Y)")
 
     np.save(FUSED_PATH, fused_pc)
+    np.save(FUSED_RGB_PATH, fused_rgb)
+    pcd.points = o3d.utility.Vector3dVector(fused_pc)   # keep the .ply in the same gravity-aligned frame as the .npy + mesh
+    pcd.colors = o3d.utility.Vector3dVector(fused_rgb)  # true-colour fused cloud
     o3d.io.write_point_cloud(os.path.join(OUTPUT_DIR, "fused_pointcloud.ply"), pcd)
+    with open(OBJECTS_PATH, "wb") as f:
+        pickle.dump(registered_objects, f)   # saved after gravity rotation so resume loads correct frame
 
     # Save the OBSERVED surface and the OCCLUDED completions separately, so
     # evaluation can score them honestly: visible-region F1 on the observed cloud,
@@ -1196,7 +1235,7 @@ else:
     # clean colored point cloud + Poisson surface mesh — a complete textured
     # object scene, distinct from the semantic mesh.
     if colored_objects:
-        co_xyz = np.concatenate([a for a, _ in colored_objects], 0) @ R_g.T
+        co_xyz = np.concatenate([a for a, _ in colored_objects], 0)   # already gravity-aligned
         co_rgb = np.clip(np.concatenate([c for _, c in colored_objects], 0), 0, 1)
         cpcd = o3d.geometry.PointCloud()
         cpcd.points = o3d.utility.Vector3dVector(co_xyz)
@@ -1231,161 +1270,173 @@ else:
             print(f"  colored objects mesh skipped: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PHASE E: SEMANTIC LABELING (Mask2Former, multi-view voting)
+# PHASE F: MESH GENERATION — per-object Poisson + background Poisson
 # ═══════════════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
-print("[Phase E] Semantic labeling (Mask2Former)")
+print("[Phase F] Semantic mesh generation (per-object + background Poisson)")
 print("=" * 60)
 
-from sklearn.neighbors import KDTree
+# Meshing the full fused cloud in one pass creates artefacts at every
+# object-background boundary: Poisson builds webs across nearby surfaces and
+# bleeds geometry between adjacent objects. Instead: mesh each registered object
+# independently (outward normals), mesh the remaining background (inward normals
+# toward camera origin), then merge. No shared indicator function across
+# object/scene boundaries → clean seams.
 
-LABELS_PATH = os.path.join(OUTPUT_DIR, "labeled_pointcloud_labels.npy")
-if args.resume and os.path.exists(LABELS_PATH) and os.path.getmtime(LABELS_PATH) > os.path.getmtime(FUSED_PATH):
-    labels = np.load(LABELS_PATH)
-    print(f"[resume] Loaded labels: {labels.shape}")
+from scipy.spatial import cKDTree as _cKDTree   # may not be imported in resume path
+
+def _prep_obj_pcd(pts, scene_diag):
+    """Denoise + globally-consistent OUTWARD normals for one isolated object cloud.
+    Consistent tangent-plane normals (propagated over an MST, not a crude centroid
+    flip) are what let Poisson recover a round, seam-free surface instead of a lumpy
+    blob — the single biggest lever on object-mesh quality. Returns a pcd or None."""
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.asarray(pts))
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=16, std_ratio=2.0)
+    if len(pcd.points) > 9000:
+        pcd = pcd.voxel_down_sample(0.004 * scene_diag)
+    obj_pts = np.asarray(pcd.points)
+    if len(obj_pts) < 80:
+        return None
+    obj_ext = float(np.linalg.norm(obj_pts.max(0) - obj_pts.min(0))) + 1e-6
+    pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.06 * obj_ext, max_nn=60))
+    try:
+        pcd.orient_normals_consistent_tangent_plane(30)           # globally consistent
+        n = np.asarray(pcd.normals); v = obj_pts - obj_pts.mean(0)
+        if (np.einsum('ij,ij->i', n, v) > 0).mean() < 0.5:        # ensure outward
+            pcd.normals = o3d.utility.Vector3dVector(-n)
+    except Exception:                                             # fallback: cheap centroid flip
+        pcd.orient_normals_towards_camera_location(obj_pts.mean(0))
+        pcd.normals = o3d.utility.Vector3dVector(-np.asarray(pcd.normals))
+    return pcd
+
+def _poisson_trim(pcd, depth):
+    """Screened Poisson on a prepared cloud; density-trim + bbox-crop. Returns mesh or None."""
+    if len(pcd.points) < 80:
+        return None
+    m, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth, linear_fit=True)
+    dens = np.asarray(dens)
+    m.remove_vertices_by_mask(dens < np.quantile(dens, 0.04))
+    m = m.crop(pcd.get_axis_aligned_bounding_box())
+    return m if len(m.vertices) > 0 else None
+
+combined_mesh = o3d.geometry.TriangleMesh()
+col_ref_pts = [fused_pc]; col_ref_rgb = [fused_rgb]   # colour reference for final per-vertex colouring
+
+# Source: the PURE Amodal3R cloud (no observed-front graft → no seam ridge) when
+# available; fall back to the grafted registered_objects on resume.
+obj_sources = [(np.asarray(o), c) for o, c in
+               (colored_objects if colored_objects else [(o, None) for o in registered_objects])
+               if len(np.asarray(o)) >= 80]
+# colour reference: object verts get their exact Amodal3R gaussian colour
+for obj_pts, obj_rgb in obj_sources:
+    if obj_rgb is not None:
+        col_ref_pts.append(obj_pts); col_ref_rgb.append(np.clip(np.asarray(obj_rgb), 0, 1))
+
+# ── Per-object meshes: NKSR (smooth, watertight) with screened-Poisson fallback ──
+NKSR_PY = os.environ.get("IRIS_NKSR_PY", sys.executable.replace("/envs/iris/", "/envs/nksr/"))
+nksr_ok = False
+if obj_sources and os.environ.get("IRIS_OBJ_MESHER", "nksr") != "poisson" and os.path.exists(NKSR_PY):
+    try:
+        nin = os.path.join(OUTPUT_DIR, "_nksr_in.npz"); nout = os.path.join(OUTPUT_DIR, "objects_nksr.ply")
+        np.savez(nin, **{f"obj_{k}": p for k, (p, _) in enumerate(obj_sources)})
+        nscript = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nksr_mesh.py")
+        r = subprocess.run([NKSR_PY, nscript, nin, nout], capture_output=True, text=True, timeout=600)
+        if "NKSR_MESH_OK" in r.stdout and os.path.exists(nout):
+            om = o3d.io.read_triangle_mesh(nout)
+            if len(om.vertices) > 0:
+                combined_mesh += om; nksr_ok = True
+                print(f"  objects (NKSR): {r.stdout.strip().splitlines()[-1]}")
+        if not nksr_ok:
+            print(f"  NKSR objects empty/failed → Poisson fallback ({r.stderr.strip()[-160:]})")
+    except Exception as e:
+        print(f"  NKSR objects error → Poisson fallback ({e})")
+if not nksr_ok:                                           # screened Poisson per object
+    for k, (obj_pts, obj_rgb) in enumerate(obj_sources):
+        pcd_obj = _prep_obj_pcd(obj_pts, scene_diag)
+        if pcd_obj is None:
+            continue
+        m = _poisson_trim(pcd_obj, depth=9)
+        if m is None:
+            print(f"  object {k}: Poisson returned empty mesh, skipped")
+            continue
+        combined_mesh += m.filter_smooth_taubin(number_of_iterations=10)
+        print(f"  object {k}: {len(obj_pts)} pts → {len(m.vertices)} verts, {len(m.triangles)} faces")
+
+# ── Background: plane-filled flat table+wall, meshed with NKSR (Poisson fallback) ──
+if bg_inview is not None:
+    bg_pts, bg_rgb = bg_inview, bg_inview_rgb
+elif registered_objects:                                     # resume fallback: exact subtraction
+    keep = _cKDTree(np.concatenate([np.asarray(o) for o in registered_objects], 0)).query(fused_pc, workers=4)[0] > 0.02 * scene_diag
+    bg_pts, bg_rgb = fused_pc[keep], fused_rgb[keep]
 else:
-    from transformers import AutoImageProcessor, Mask2FormerForUniversalSegmentation
+    bg_pts, bg_rgb = fused_pc, fused_rgb
+print(f"  background: {len(bg_pts)} pts")
+col_ref_pts.append(bg_pts); col_ref_rgb.append(np.clip(bg_rgb, 0, 1))   # colour bg verts (incl. fill)
 
-    m2f_processor = AutoImageProcessor.from_pretrained("facebook/mask2former-swin-large-ade-semantic")
-    m2f = Mask2FormerForUniversalSegmentation.from_pretrained(
-        "facebook/mask2former-swin-large-ade-semantic", torch_dtype=torch.float16).to("cuda").eval()
+bg_done = False
+if len(bg_pts) >= 200 and nksr_ok:                            # NKSR (open-surface mode)
+    try:
+        nbin = os.path.join(OUTPUT_DIR, "_nksr_bg_in.npz"); nbout = os.path.join(OUTPUT_DIR, "background_nksr.ply")
+        np.savez(nbin, obj_0=bg_pts.astype(np.float32))
+        rb = subprocess.run([NKSR_PY, os.path.join(os.path.dirname(os.path.abspath(__file__)), "nksr_mesh.py"),
+                             nbin, nbout, "bg"], capture_output=True, text=True, timeout=600)
+        if "NKSR_MESH_OK" in rb.stdout and os.path.exists(nbout):
+            bg_m = o3d.io.read_triangle_mesh(nbout)
+            if len(bg_m.vertices) > 0:
+                combined_mesh += bg_m; bg_done = True
+                print(f"  background (NKSR): {rb.stdout.strip().splitlines()[-1]}")
+        if not bg_done:
+            print(f"  NKSR background empty/failed → Poisson fallback ({rb.stderr.strip()[-160:]})")
+    except Exception as e:
+        print(f"  NKSR background error → Poisson fallback ({e})")
+if not bg_done and len(bg_pts) >= 80:                         # screened-Poisson fallback (hole-filling)
+    bg_pcd = o3d.geometry.PointCloud(); bg_pcd.points = o3d.utility.Vector3dVector(bg_pts)
+    bg_pcd = bg_pcd.voxel_down_sample(0.005 * scene_diag)
+    bg_pcd, _ = bg_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    bg_pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.03 * scene_diag, max_nn=30))
+    bg_pcd.orient_normals_towards_camera_location(np.zeros(3))
+    bg_m, _bdn = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(bg_pcd, depth=10, linear_fit=True)
+    _bdn = np.asarray(_bdn); bg_m.remove_vertices_by_mask(_bdn < np.quantile(_bdn, 0.01))
+    bg_m = bg_m.crop(bg_pcd.get_axis_aligned_bounding_box())
+    _tc, _nt, _ = bg_m.cluster_connected_triangles(); _nt = np.asarray(_nt)
+    if len(_nt):
+        bg_m.remove_triangles_by_mask((_nt < 0.05 * _nt.max())[np.asarray(_tc)]); bg_m.remove_unreferenced_vertices()
+    if len(bg_m.vertices) > 0:
+        combined_mesh += bg_m
+        print(f"  background (Poisson): {len(bg_m.vertices)} verts, {len(bg_m.triangles)} faces")
 
-    # Objects are labeled from the SAM3 instance masks + VLM names (open-vocab →
-    # canonical class); background structure (floor/wall/ceiling/...) from
-    # Mask2Former. Per view we build a class map: Mask2Former stuff first, then
-    # paint the instance masks on top (objects take precedence). -1 = unlabeled.
-    recs_by_view = {}
-    for uid, vidx, m, _ in object_records:
-        recs_by_view.setdefault(vidx, []).append((uid, m))
-
-    ref_pts, ref_labels = [], []
-    for v, path in enumerate(view_paths):
-        img_v = Image.open(path).convert("RGB")
-        inputs = m2f_processor(images=img_v, return_tensors="pt")
-        inputs = {k: v_.to(device="cuda", dtype=torch.float16) if torch.is_floating_point(v_) else v_.to("cuda")
-                  for k, v_ in inputs.items()}
-        with torch.no_grad():
-            out = m2f(**inputs)
-        seg = m2f_processor.post_process_semantic_segmentation(
-            out, target_sizes=[(Hv, Wv)])[0].cpu().numpy()
-        cmap = np.full(seg.shape, -1, dtype=np.int32)                 # unlabeled
-        for ade_id, iris_label in ADE20K_TO_IRIS.items():            # background stuff
-            cmap[seg == ade_id] = IRIS_LABEL_TO_ID[iris_label]
-        for uid, m in recs_by_view.get(v, []):                       # objects (priority)
-            om = cv2.resize(m, (Wv, Hv), interpolation=cv2.INTER_NEAREST) > 0.5
-            cmap[om] = IRIS_LABEL_TO_ID[name_to_class(uid)]
-
-        valid = scene_mask[v] & (cmap >= 0)
-        ref_pts.append(world_points[v][valid])
-        ref_labels.append(cmap[valid])
-        print(f"  Labeled view {v}: {os.path.basename(path)} ({int(valid.sum())} ref pts)")
-
-    ref_pts = np.concatenate(ref_pts, axis=0)
-    ref_labels = np.concatenate(ref_labels, axis=0)
-
-    tree = KDTree(ref_pts)
-    dist, ind = tree.query(fused_pc, k=5)
-    labels = np.full(len(fused_pc), IRIS_LABEL_TO_ID["other"], dtype=np.int32)
-    radius = 0.02 * scene_diag
-    for i in range(len(fused_pc)):
-        near = ind[i][dist[i] < radius]
-        if len(near) > 0:
-            labels[i] = np.bincount(ref_labels[near]).argmax()
-
-    print("\nLabel distribution:")
-    for name, lid in IRIS_LABEL_TO_ID.items():
-        n = int((labels == lid).sum())
-        print(f"  {name}: {n} points ({100*n/len(labels):.1f}%)")
-
-    np.save(os.path.join(OUTPUT_DIR, "labeled_pointcloud_points.npy"), fused_pc)
-    np.save(LABELS_PATH, labels)
-    colors = np.array([LABEL_COLORS[l] for l in labels])
-    pcd.points = o3d.utility.Vector3dVector(fused_pc)
-    pcd.colors = o3d.utility.Vector3dVector(colors)
-    o3d.io.write_point_cloud(os.path.join(OUTPUT_DIR, "labeled_pointcloud.ply"), pcd)
-
-    free_cuda(m2f, m2f_processor)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE F: MESH GENERATION (Marching Cubes)
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 60)
-print("[Phase F] Semantic mesh generation (Marching Cubes)")
-print("=" * 60)
-
-from skimage import measure
-from scipy import ndimage
-
-# Finer grid → the dilation/smoothing no longer bridges across depth-discontinuity
-# gaps (e.g. a tall object's edge to the wall behind it), which is what produced
-# the "skirt" / webbing artifacts behind foreground objects in single-view recon.
-GRID = 160
-mins = fused_pc.min(0)
-maxs = fused_pc.max(0)
-span = (maxs - mins).max()
-voxel = span / (GRID - 1)
-
-idx = np.clip(((fused_pc - mins) / voxel).astype(int), 0, GRID - 1)
-occ = np.zeros((GRID, GRID, GRID), dtype=np.float32)
-occ[idx[:, 0], idx[:, 1], idx[:, 2]] = 1.0
-occ = ndimage.binary_dilation(occ, iterations=1).astype(np.float32)
-occ = ndimage.gaussian_filter(occ, sigma=1.0)
-
-verts, faces, _, _ = measure.marching_cubes(occ, level=0.5)
-verts_world = verts * voxel + mins
-
-mesh_o3d = o3d.geometry.TriangleMesh()
-mesh_o3d.vertices = o3d.utility.Vector3dVector(verts_world)
-mesh_o3d.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
-
-# drop tiny disconnected fragments (meshing artifacts), keeping the main surface
-# and any object-sized components — threshold is RELATIVE so real objects survive.
-tri_clusters, n_tri, _ = mesh_o3d.cluster_connected_triangles()
+# ── Fragment removal ─────────────────────────────────────────────────────────
+tri_clusters, n_tri, _ = combined_mesh.cluster_connected_triangles()
 n_tri = np.asarray(n_tri)
-small = n_tri < 0.01 * n_tri.max()
-mesh_o3d.remove_triangles_by_mask(small[np.asarray(tri_clusters)])
-mesh_o3d.remove_unreferenced_vertices()
+n_small = 0
+if len(n_tri):
+    small = n_tri < 0.01 * n_tri.max()
+    combined_mesh.remove_triangles_by_mask(small[np.asarray(tri_clusters)])
+    combined_mesh.remove_unreferenced_vertices()
+    n_small = int(small.sum())
+mesh_o3d = combined_mesh
 verts_world = np.asarray(mesh_o3d.vertices)
-print(f"Mesh: {len(verts_world)} vertices, {len(mesh_o3d.triangles)} faces "
-      f"({int(small.sum())} fragment component(s) removed)")
+print(f"Mesh (Poisson): {len(verts_world)} vertices, {len(mesh_o3d.triangles)} faces "
+      f"({n_small} fragment component(s) removed)")
 
-vert_tree = KDTree(fused_pc)
-_, vi = vert_tree.query(verts_world, k=1)
-vert_labels = labels[vi[:, 0]]
-vert_colors = np.array([LABEL_COLORS[l] for l in vert_labels])
-mesh_o3d.vertex_colors = o3d.utility.Vector3dVector(vert_colors)
+# colour each vertex from the nearest reference point: true photometric RGB —
+# background from the input/peeled views (fused_pc), object verts from the pure
+# Amodal3R gaussian colours (object meshes are built from the pure cloud, which
+# isn't in fused_pc, so it must be in the colour reference).
+from scipy.spatial import cKDTree as _vertKDTree
+col_ref_pts = np.concatenate(col_ref_pts, 0)
+col_ref_rgb = np.concatenate(col_ref_rgb, 0)
+_, vi = _vertKDTree(col_ref_pts).query(verts_world, workers=4)
+mesh_o3d.vertex_colors = o3d.utility.Vector3dVector(np.clip(col_ref_rgb[vi], 0, 1))
 mesh_o3d.compute_vertex_normals()
-mesh_path = os.path.join(OUTPUT_DIR, "final_semantic_mesh.ply")
+mesh_path = os.path.join(OUTPUT_DIR, "final_mesh.ply")
 o3d.io.write_triangle_mesh(mesh_path, mesh_o3d)
-np.save(os.path.join(OUTPUT_DIR, "final_mesh_vertex_labels.npy"), vert_labels)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE G: FREE / OCCUPIED / OCCLUDED OCCUPANCY (occlusion-aware classification)
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 60)
-print("[Phase G] Occupancy classification (free / occupied / occluded)")
-print("=" * 60)
-
-from step10_occupancy import compute_occupancy, render as render_occ, FREE, OCCUPIED, OCCLUDED
-
-occ_grid, occ_min, occ_voxel, occ_dims = compute_occupancy(
-    world_points, conf, extrinsics, fused_pc,
-    object_clouds=registered_objects, grid=160)
-occ_total = int(np.prod(occ_dims))
-for lab, name in [(FREE, "free"), (OCCUPIED, "occupied"), (OCCLUDED, "occluded")]:
-    n = int((occ_grid == lab).sum())
-    print(f"  {name:9s}: {n:>9d}  ({100*n/occ_total:5.1f}%)")
-np.save(os.path.join(OUTPUT_DIR, "occupancy_grid.npy"), occ_grid)
-np.savez(os.path.join(OUTPUT_DIR, "occupancy_meta.npz"),
-         grid_min=occ_min, voxel=occ_voxel, dims=occ_dims)
-render_occ(occ_grid, occ_min, occ_voxel, os.path.join(OUTPUT_DIR, "occupancy_render.png"))
 
 print(f"\n{'='*60}")
 print("IRIS pipeline complete!")
 print(f"  Synthetic views:    {VIEWS_DIR}/")
 print(f"  Fused point cloud:  {OUTPUT_DIR}/fused_pointcloud.ply")
-print(f"  Labeled cloud:      {OUTPUT_DIR}/labeled_pointcloud.ply")
-print(f"  Semantic mesh:      {mesh_path}")
+print(f"  Mesh (true colour): {mesh_path}")
 print(f"  Objects (colored):  {OUTPUT_DIR}/objects_colored.ply (+ objects_mesh.ply)")
-print(f"  Occupancy grid:     {OUTPUT_DIR}/occupancy_grid.npy (+ occupancy_render.png)")
 print("=" * 60)

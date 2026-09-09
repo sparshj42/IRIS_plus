@@ -51,3 +51,23 @@ scannet/
 scannet0030_*.jpg
 eval_scannet.py
 test_occlusion_order.py
+
+# ── Non-code extras: benchmark data/drivers, ablation figures, paper/submission
+#    materials — consolidated here so they don't clutter src/scripts/models/docs
+iris_extras/
+
+# ── Benchmark run dirs: large generated inputs/outputs from ad-hoc eval scripts,
+#    not part of the shipped codebase
+3DFRONT_BENCH_2/
+3D_FRONT_BENCH_GEN3DSR/
+3d_front_bench_gen3dsr_outputs/
+3d_front_bench_outputs/
+demo_image_gen3dsr/
+gen3dsr_frame_9_output/
+gt_compare/
+minimal_indoor_images_gen3dsr_output/
+minimal_indoor_images_output/
+prayas_outputs/
+
+# ── Stray empty file
+/python
