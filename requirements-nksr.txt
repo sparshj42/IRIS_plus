@@ -1,0 +1,22 @@
+# NKSR surface-reconstruction worker env (src/nksr_mesh.py).
+# Separate env because NKSR needs torch 2.7/cu128, which conflicts with the
+# main `iris` stack (torch 2.5/cu121). Optional: without it the pipeline falls
+# back to screened Poisson.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.0+cu128
+torchvision
+
+-f https://data.pyg.org/whl/torch-2.8.0+cu128.html
+torch-scatter
+
+python-pycg>=1.0.1
+
+numpy==2.2.6
+scipy==1.15.3
+open3d==0.19.0
+matplotlib
+
+ninja
+GitPython
+pyntcloud
+plyfile

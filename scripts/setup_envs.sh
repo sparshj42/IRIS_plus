@@ -3,17 +3,21 @@
 # IRIS reproducible setup — creates the conda envs and clones the third-party
 # model repos. Portable: uses conda env NAMES (no hardcoded home paths).
 #
-#   bash scripts/setup_envs.sh            # all envs (iris + amodal3r + trellis)
-#   bash scripts/setup_envs.sh iris       # just the main env
+#   bash scripts/setup_envs.sh            # all envs (iris + amodal3r + trellis + nksr)
+#   bash scripts/setup_envs.sh iris amodal3r   # a subset (any combination)
 #   bash scripts/setup_envs.sh amodal3r   # just the Amodal3R env (default backend, +repo)
 #   bash scripts/setup_envs.sh trellis    # just the TRELLIS env (baseline backend, +repo)
+#   bash scripts/setup_envs.sh nksr       # just the NKSR meshing env (optional, builds CUDA ext)
 #
 # After this: python scripts/fetch_weights.py   (downloads RORem)
 # ============================================================================
 set -e
 cd "$(dirname "$0")/.."
 REPO="$PWD"
-WHAT="${1:-all}"
+TARGETS="${*:-all}"
+want() {   # want <name> -> true if that env was requested (or "all")
+  case " $TARGETS " in *" all "*) return 0;; *" $1 "*) return 0;; *) return 1;; esac
+}
 
 # Initialize conda if it's not already on PATH (common in fresh WSL shells)
 if ! command -v conda &>/dev/null; then
@@ -32,7 +36,7 @@ fi
 pipx() { PYTHONNOUSERSITE=1 conda run -n "$1" pip install "${@:2}"; }
 
 # ---------------------------------------------------------------- main: iris
-if [ "$WHAT" = all ] || [ "$WHAT" = iris ]; then
+if want iris; then
   echo ">>> [iris] main pipeline env"
   conda env list | grep -q "^iris " || conda create -n iris python=3.10 -y
   pipx iris torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu121
@@ -53,7 +57,7 @@ if [ "$WHAT" = all ] || [ "$WHAT" = iris ]; then
 fi
 
 # ------------------------------------------------------------ TRELLIS (image->3D)
-if [ "$WHAT" = all ] || [ "$WHAT" = trellis ]; then
+if want trellis; then
   echo ">>> [trellis] env + repo (gaussian/point-cloud path; no mesh CUDA builds)"
   [ -d models/TRELLIS ] || git clone --recurse-submodules https://github.com/microsoft/TRELLIS models/TRELLIS
   ( cd models/TRELLIS && git submodule update --init --recursive )
@@ -83,7 +87,7 @@ fi
 # Amodal3R is a TRELLIS fork; IRIS uses its gaussian path only, so we install the same
 # lightweight stack as the trellis env (spconv/xformers/utils3d, no mesh CUDA builds) and
 # clone the repo onto the path. For the full mesh pipeline see Amodal3R's own setup.sh.
-if [ "$WHAT" = all ] || [ "$WHAT" = amodal3r ]; then
+if want amodal3r; then
   echo ">>> [amodal3r] env + repo (default backend; occlusion-aware; gaussian path)"
   [ -d models/Amodal3R ] || git clone https://github.com/Sm0kyWu/Amodal3R models/Amodal3R
   conda env list | grep -q "^amodal3r " || conda create -n amodal3r python=3.10 -y
@@ -102,5 +106,31 @@ if [ "$WHAT" = all ] || [ "$WHAT" = amodal3r ]; then
   echo ">>> [amodal3r] done"
 fi
 
+# ------------------------------------------------- NKSR (surface reconstruction)
+# OPTIONAL. Gives smoother, watertight object meshes than screened Poisson. Needs
+# torch 2.7/cu128 and compiles a CUDA extension, so it cannot share the iris env.
+# If this env is absent the pipeline falls back to Poisson automatically, so a
+# failure here is not fatal to the install.
+if want nksr; then
+  echo ">>> [nksr] env + repo (optional; builds a CUDA extension)"
+  (
+    set -e
+    : "${CUDA_HOME:=/usr/local/cuda-12.8}"
+    export CUDA_HOME
+    export PATH="$CUDA_HOME/bin:$PATH"
+    export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+    command -v nvcc >/dev/null || { echo "  nvcc not found under CUDA_HOME=$CUDA_HOME"; exit 1; }
+    echo "  nvcc: $(nvcc --version | grep release)"
+    [ -d models/NKSR ] || git clone https://github.com/nv-tlabs/NKSR models/NKSR
+    conda env list | grep -q "^nksr " || conda create -n nksr python=3.10 -y
+    pipx nksr -r requirements-nksr.txt
+    # build the CUDA extension from the cloned source (no build isolation so it
+    # links against the torch already installed in this env)
+    pipx nksr --no-build-isolation ./models/NKSR/package/
+    conda run -n nksr python -c "import torch, nksr; print('  NKSR ok — torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+  ) || echo "  [nksr] setup FAILED — optional; pipeline will use screened Poisson instead."
+  echo ">>> [nksr] done"
+fi
+
 echo ""
-echo "Envs ready. Next: python scripts/fetch_weights.py"
+echo "Envs ready. Next: conda run -n iris python scripts/fetch_weights.py"

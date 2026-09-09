@@ -35,9 +35,29 @@ alias is in code). VGGT is installed into `iris`.
 | `iris` | full pipeline (VLM, SAM3, depth, RORem, VGGT, Mask2Former, occupancy) | torch 2.5.1+cu121, transformers 5.9, diffusers 0.38 |
 | `amodal3r` | **Amodal3R** image-to-3D (`--image3d amodal3r`, default) | torch 2.4.0+cu118, spconv-cu118, xformers 0.0.27 |
 | `trellis` | TRELLIS image-to-3D (`--image3d trellis`, baseline) | torch 2.4.1+cu118, spconv-cu118, xformers 0.0.28 |
+| `nksr` | NKSR surface reconstruction (optional; Poisson fallback if absent) | torch 2.7.0+cu128, CUDA extension built from source |
 
 Only the `iris` env plus the env for your chosen `--image3d` backend are required;
-the default uses the `amodal3r` env.
+the default uses the `amodal3r` env. `setup_envs.sh` accepts any combination of
+targets, e.g. `bash scripts/setup_envs.sh iris amodal3r nksr`.
+
+### The `nksr` env (optional)
+
+NKSR produces smoother, watertight object meshes than screened Poisson, and the
+pipeline prefers it when the env exists. Building it clones
+<https://github.com/nv-tlabs/NKSR> into `models/NKSR` and compiles a CUDA extension,
+so it needs `nvcc` available — `CUDA_HOME` defaults to `/usr/local/cuda-12.8`,
+override it if your toolkit lives elsewhere:
+
+```bash
+CUDA_HOME=/usr/local/cuda-12.8 bash scripts/setup_envs.sh nksr
+```
+
+If the env is missing or the build fails, the pipeline logs the fallback and uses
+screened Poisson instead — the run still completes. The two meshers give different
+geometry, so record which one produced any numbers you report. Force the fallback
+explicitly with `IRIS_OBJ_MESHER=poisson`; point at a non-standard interpreter with
+`IRIS_NKSR_PY`.
 
 ## Configuration / overrides
 
@@ -48,6 +68,8 @@ All optional; defaults resolve under the repo. Set if your layout differs:
 | `IRIS_ROREM_CKPT` | `checkpoints/RORem` |
 | `IRIS_VLM_ID` | `Qwen/Qwen3-VL-32B-Instruct` (override with 8B id for smaller GPUs, or use `--vlm`) |
 | `IRIS_AMODAL3R_DIR` / `IRIS_TRELLIS_DIR` | `models/<name>` |
+| `IRIS_NKSR_PY` | auto-detected `nksr` env python |
+| `IRIS_OBJ_MESHER` | `nksr` (set `poisson` to force the fallback) |
 | `IRIS_AMODAL3R_PYTHON` / `IRIS_TRELLIS_PYTHON` | auto-detected conda env python |
 
 The worker envs are auto-located via `CONDA_EXE` / common conda roots; override the
