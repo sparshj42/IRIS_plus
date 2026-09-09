@@ -52,7 +52,7 @@ pipeline in two independent ways, and `--depth` supplies both:
 |---|---|---|
 | **Peel ordering** | DepthAnythingV2 monocular depth | the **sensor depth directly** (no depth model) |
 | **Metric scale** | proportional only (arbitrary scale) | **true metric** (sensor depth → scale factor) |
-| **Reconstruction-accuracy KPI (cm)** | not metric | meaningful (the `< 2 cm` numbers) |
+| **Reconstruction accuracy (cm)** | not metric | meaningful in real units |
 
 ```bash
 # RGB-D: depth.npy is a dense (H×W) float metric depth map, aligned to --image
@@ -61,8 +61,8 @@ python src/pipeline.py --image frame.jpg --depth depth.npy --output_dir output
 
 Notes:
 - `--depth` is the input the **benchmark uses** — sensor depth gives the recon true
-  metric scale, so the centimetre accuracy numbers in [kpis.md](kpis.md) are real
-  (the geometry is still color/VGGT-derived; depth only fixes scale + ordering).
+  metric scale, so reported centimetre accuracies are in real units (the geometry is
+  still colour/VGGT-derived; depth only fixes scale + ordering).
 - If you only have **sparse** metric points (not a dense map), use `--sparse_depth`
   instead — it fixes scale but peel ordering still uses DepthAnythingV2.
 - The depth map is resized to the RGB resolution internally, so it does not need to
@@ -96,7 +96,7 @@ python src/pipeline.py --image rgb.png --sparse_depth sparse.npy --output_dir ou
 ```
 
 Without `--sparse_depth` the reconstruction is up-to-scale (fine for the
-occlusion/semantic outputs; required only for the metric `<2 cm` KPI).
+occlusion/semantic outputs; metric units require one of the depth inputs).
 
 ## Re-running occupancy standalone
 

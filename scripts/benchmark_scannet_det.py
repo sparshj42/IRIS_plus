@@ -126,7 +126,3 @@ if comp is not None and len(gt_occ):
     print(f"  -> image-to-3D recovers {100*(rec_occ-rec_occ_obs):.1f}% more occluded surface")
 else:
     print("  no completions (skip_3d) -> occluded recall not applicable")
-
-print("\n=== KPI SCORECARD ===")
-print(f"  Visible F1            {F1:.2f}      (target >0.95, benchmark 0.85)")
-print(f"  Reconstruction acc   {d_acc.mean()*100:.1f} cm mean / {np.median(d_acc)*100:.1f} cm median   (target <2cm, benchmark 5cm)")

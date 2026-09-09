@@ -1,6 +1,6 @@
 """Sample ~N sparse depth points from a dense depth map -> sparse .npy of
 (row, col, metric_depth), simulating the problem's ~500-px sparse depth input.
-For KPI eval: feed a dataset's GT depth here, then run the pipeline with
+For evaluation: feed a dataset's GT depth here, then run the pipeline with
 --sparse_depth <out>.
 """
 import argparse

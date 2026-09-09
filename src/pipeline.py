@@ -877,7 +877,7 @@ else:
     intrinsics = intri.squeeze(0).cpu().float().numpy()   # (V, 3, 3)
 
     # Sparse-depth metric scaling: make the reconstruction metric so it can be
-    # measured against the <2 cm KPI (VGGT alone is up-to-scale).
+    # reported in real units (VGGT alone is up-to-scale).
     metric_scale = 1.0
     if args.sparse_depth:
         metric_scale = metric_scale_from_sparse(
