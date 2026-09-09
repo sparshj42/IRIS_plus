@@ -191,12 +191,13 @@ empty:
 *Orthogonal slices through the occupancy grid. Volume hidden behind a surface is
 labelled occluded, not free.*
 
-And the fused scene can be viewed from angles the camera never occupied:
+And the fused mesh can be viewed from angles the camera never occupied:
 
 ![Reconstruction](docs/images/reconstruction.png)
 
-*The fused reconstruction rendered from an off-axis viewpoint. The input was a
-single frontal photograph.*
+*Left: the single input photograph. Right: the fused mesh rendered from two novel
+viewpoints. Each object is a closed volume — the peeled crops let image-to-3D
+complete the back and sides, which no pixel of the input observed.*
 
 ## Reproducing the benchmarks
 
