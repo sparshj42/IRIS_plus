@@ -17,11 +17,12 @@ unknown**, rather than as free space.
 IRIS is **training-free**. It composes open-weight models; no component is
 fine-tuned, and there are no runtime API calls.
 
-![Peel sequence](docs/images/peeling_sequence.png)
+![Occlusion graph and peel order](docs/images/occlusion_graph.png)
 
-*One peel iteration per panel. The front-most object is segmented, reconstructed,
-then erased — revealing the surface behind it to the next iteration. The camera
-never moves, so the panels form a same-pose view stack.*
+*The occlusion graph IRIS builds for one scene. An arrow A→B means A occludes B and
+must be peeled first; the node numbers are the resulting order. Edges come from
+comparing depth in the contact band where two masks meet, with a physical-support
+tie-break when depth is inconclusive.*
 
 ```
 RGB image
@@ -37,6 +38,21 @@ RGB image
    └─ instance-aware semantic labelling  (Mask2Former)
    └─ free / occupied / occluded occupancy grid
 ```
+
+### Why the peel order matters
+
+Peeling is only sound if an occluder is removed *before* whatever it hides. Get that
+wrong and the inpainter paints over geometry that is still covered, and the crop
+handed to image-to-3D is contaminated:
+
+![Peel-order ablation](docs/images/peel_order_ablation.png)
+
+*Top: the occlusion graph peels the plum first, so the watermelon crop is complete.
+Bottom: a naive nearest-depth sort peels the watermelon first while the plum still
+occludes it — the crop bleeds into a distorted bulge and the removal leaves a ghost.*
+
+This is why ordering is a pairwise question decided at contact, not a global depth
+sort. The naive baseline above is reproducible with `IRIS_PEEL_ORDER=naive`.
 
 Full technical breakdown: [docs/architecture.md](docs/architecture.md).
 
@@ -175,9 +191,12 @@ empty:
 *Orthogonal slices through the occupancy grid. Volume hidden behind a surface is
 labelled occluded, not free.*
 
-The fused cloud carries instance-aware semantic labels:
+And the fused scene can be viewed from angles the camera never occupied:
 
-![Labelled reconstruction](docs/images/final_reconstruction.png)
+![Reconstruction](docs/images/reconstruction.png)
+
+*The fused reconstruction rendered from an off-axis viewpoint. The input was a
+single frontal photograph.*
 
 ## Reproducing the benchmarks
 
