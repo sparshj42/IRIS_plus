@@ -68,13 +68,21 @@ def load_camera(path, gl):
     return K, W, H, c2w
 
 
-def load_pred(path, n_samples):
+def load_pred(path, n_samples, K=None, W=None, H=None, w2c=None):
+    """Points of a prediction. Meshes are sampled inside the camera frustum only (the
+    frustum test is scale-invariant, so it is valid before alignment), so a mesh that
+    includes a whole room still gets dense samples where the camera looks."""
     if path.endswith(".npy"):
         return np.load(path)[:, :3].astype(np.float64)
     m = o3d.io.read_triangle_mesh(path)
-    if len(m.triangles) > 0:
-        return np.asarray(m.sample_points_uniformly(n_samples).points)
-    return np.asarray(o3d.io.read_point_cloud(path).points)
+    if len(m.triangles) == 0:
+        return np.asarray(o3d.io.read_point_cloud(path).points)
+    P = np.asarray(m.sample_points_uniformly(n_samples).points)
+    if K is not None:
+        Pc = P if w2c is None else P @ w2c[:3, :3].T + w2c[:3, 3]
+        frac = max(in_frustum(Pc, K, W, H).mean(), 1e-3)
+        P = np.asarray(m.sample_points_uniformly(int(min(n_samples / frac, 20 * n_samples))).points)
+    return P
 
 
 def sample_mesh(V, F, n, rng):
@@ -86,6 +94,57 @@ def sample_mesh(V, F, n, rng):
     s = np.sqrt(r1)
     P = (1 - s)[:, None] * a[fid] + (s * (1 - r2))[:, None] * b[fid] + (s * r2)[:, None] * c[fid]
     return P, fid
+
+
+def clip_poly(poly, lo, hi):
+    """Sutherland-Hodgman clip of a convex polygon (m,3) to an axis-aligned box."""
+    for ax in range(3):
+        for bound, keep_ge in ((lo[ax], True), (hi[ax], False)):
+            if len(poly) == 0:
+                return poly
+            out = []
+            for i in range(len(poly)):
+                p, q = poly[i], poly[(i + 1) % len(poly)]
+                pin = p[ax] >= bound if keep_ge else p[ax] <= bound
+                qin = q[ax] >= bound if keep_ge else q[ax] <= bound
+                if pin:
+                    out.append(p)
+                if pin != qin:
+                    s = (bound - p[ax]) / (q[ax] - p[ax])
+                    out.append(p + s * (q - p))
+            poly = np.array(out)
+    return poly
+
+
+def clip_mesh_to_box(V, F, lo, hi):
+    """Triangles restricted to the box: whole triangles inside are kept, crossing ones
+    are clipped and re-fanned. Returns (vertices, faces, source face per triangle) so
+    that sampling puts every point in the box (a room's walls would otherwise take
+    nearly all area-uniform samples away from the objects)."""
+    T = V[F]
+    tmin, tmax = T.min(1), T.max(1)
+    touch = np.all(tmax >= lo, 1) & np.all(tmin <= hi, 1)
+    inside = np.all(tmin >= lo, 1) & np.all(tmax <= hi, 1)
+    keep = np.where(inside)[0]
+    newT, src = [T[keep]], [keep]
+    for f in np.where(touch & ~inside)[0]:
+        poly = clip_poly(T[f], lo, hi)
+        if len(poly) >= 3:
+            fan = np.stack([np.repeat(poly[:1], len(poly) - 2, 0), poly[1:-1], poly[2:]], 1)
+            newT.append(fan); src.append(np.full(len(fan), f))
+    T2, src = np.concatenate(newT), np.concatenate(src)
+    return T2.reshape(-1, 3), np.arange(len(T2) * 3).reshape(-1, 3), src
+
+
+def roi_box(V, F, face_inst, K, W, H, margin):
+    """Camera-frame box around the in-view vertices of object instances (+margin)."""
+    P = V[np.unique(F[face_inst >= 0])]
+    P = P[in_frustum(P, K, W, H)]
+    if len(P) == 0:
+        raise SystemExit("no object instance is in view")
+    lo, hi = np.percentile(P, 0.5, 0), np.percentile(P, 99.5, 0)
+    m = margin * (hi - lo)
+    return lo - m, hi + m
 
 
 def project(P, K):
@@ -184,7 +243,16 @@ def align_sim3(pred, gt_vis, K, W, H, tau, cell=4):
     refines it. Scale is never re-estimated by ICP, which drifts on partial
     predictions. Only visible GT is used."""
     cg, ig = zbuffer(gt_vis, K, W, H, cell)
-    cp, ip = zbuffer(pred, K, W, H, cell)
+    # A complete (amodal) but sparse prediction can leave a cell without any visible
+    # point, and the cell's front-most point is then a hidden surface. Hidden-point
+    # removal from the camera centre (Katz et al. 2007, scale-invariant) first keeps
+    # only points the camera can see.
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pred))
+    span = float(np.linalg.norm(pred.max(0) - pred.min(0)))
+    _, seen = pc.hidden_point_removal([0.0, 0.0, 0.0], span * 100)
+    seen = np.asarray(seen, np.int64)
+    cp, ip = zbuffer(pred[seen], K, W, H, cell)
+    ip = seen[ip]
     common, a, b = np.intersect1d(cp, cg, return_indices=True)
     if len(common) < 50:
         raise RuntimeError(f"only {len(common)} shared z-buffer cells; prediction is not in the input camera frame?")
@@ -353,9 +421,22 @@ def evaluate(a):
     if face_inst is not None and len(face_inst) != len(F):
         raise SystemExit(f"face_inst has {len(face_inst)} entries for {len(F)} faces")
 
-    G, fid = sample_mesh(V, F, a.n_gt, rng)
+    roi_lo = roi_hi = None
+    if a.roi == "objects":
+        # Evaluate where the objects are: a room in view would otherwise set the
+        # diagonal (and tau) to metres and take nearly all samples. The mesh is
+        # clipped to the box before sampling; occluders outside the box still
+        # count, since ray casting below uses the full mesh.
+        if face_inst is None:
+            raise SystemExit("--roi objects needs --gt_face_inst")
+        roi_lo, roi_hi = roi_box(V, F, face_inst, K, W, H, a.roi_margin)
+        Vs, Fs, src = clip_mesh_to_box(V, F, roi_lo, roi_hi)
+    else:
+        Vs, Fs, src = V, F, np.arange(len(F))
+    G, sfid = sample_mesh(Vs, Fs, a.n_gt * 2, rng)
+    fid = src[sfid]
     inview = in_frustum(G, K, W, H)
-    G, fid = G[inview], fid[inview]
+    G, fid = G[inview][:a.n_gt], fid[inview][:a.n_gt]
     diag = float(np.linalg.norm(G.max(0) - G.min(0)))
     tau, eps = a.tau * diag, 1e-3 * diag
 
@@ -365,10 +446,11 @@ def evaluate(a):
     own = face_inst[fid] if face_inst is not None else None
     p = peel_depth(ray, prim, face_inst, own, len(G)) if face_inst is not None else None
 
-    pred = load_pred(a.pred, a.n_pred)
-    if a.pred_w2c:
-        T = np.load(a.pred_w2c)
+    T = np.load(a.pred_w2c) if a.pred_w2c else None
+    pred = load_pred(a.pred, a.n_pred, K, W, H, T)
+    if T is not None:
         pred = (T[:3, :3] @ pred.T).T + T[:3, 3]
+    pred = pred[in_frustum(pred, K, W, H)]           # scale-invariant, so safe before alignment
     if len(pred) > a.n_pred:
         pred = pred[rng.choice(len(pred), a.n_pred, replace=False)]
 
@@ -379,6 +461,8 @@ def evaluate(a):
     else:
         info = {"mode": "none"}
     pin = in_frustum(pred, K, W, H)
+    if roi_lo is not None:                           # same box for the prediction
+        pin &= np.all((pred >= roi_lo) & (pred <= roi_hi), 1)
     n_pred_out = int((~pin).sum())
     pred = pred[pin]
 
@@ -440,12 +524,19 @@ def main():
     ap.add_argument("--tau", type=float, default=0.05, help="F-score threshold, fraction of in-view GT diagonal")
     ap.add_argument("--taus", type=float, nargs="*", default=[0.01, 0.02, 0.05],
                     help="extra thresholds reported under by_tau.t<percent>")
+    ap.add_argument("--roi", choices=["objects", "none"], default=None,
+                    help="'objects': score inside the 3D box around in-view object instances "
+                         "(+margin), tau relative to that box. Default: objects when "
+                         "--gt_face_inst is given, else none")
+    ap.add_argument("--roi_margin", type=float, default=0.25)
     ap.add_argument("--kmax", type=int, default=3)
     ap.add_argument("--n_gt", type=int, default=200_000)
     ap.add_argument("--n_pred", type=int, default=200_000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
+    if a.roi is None:
+        a.roi = "objects" if a.gt_face_inst else "none"
     res = evaluate(a)
     txt = json.dumps(res, indent=2, default=float)
     if a.out:

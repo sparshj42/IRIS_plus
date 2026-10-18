@@ -49,7 +49,7 @@ def build(tmp):
 def args(tmp, pred, **kw):
     a = dict(gt_mesh=f"{tmp}/gt.ply", gt_cam=f"{tmp}/cam.npz", gl_cam=False,
              gt_face_inst=f"{tmp}/face_inst.npy", pred=pred, pred_w2c=None,
-             pred_order_masks=None, align="sim3", tau=0.05, taus=[0.02], kmax=3,
+             pred_order_masks=None, align="sim3", tau=0.05, taus=[0.02], kmax=3, roi="none", roi_margin=0.25,
              n_gt=120_000, n_pred=120_000, seed=0, out=None)
     a.update(kw)
     return types.SimpleNamespace(**a)
@@ -76,6 +76,10 @@ def main():
     assert all(m["F"] > 0.97 for m in r["peel"].values() if m["n_gt"] > 500), r["peel"]
     assert r["occluded_hard"]["F"] > 0.97, r["occluded_hard"]
     assert r["layer"]["1"]["n_gt"] > 1000 and r["peel"]["2"]["n_gt"] > 100, "scene lacks deep occlusion"
+    r = E.evaluate(args(tmp, f"{tmp}/pred_full.npy", roi="objects"))
+    print("perfect, object ROI:", {k: round(m["F"], 3) for k, m in r["layer_hard"].items()},
+          "| scale", round(r["align"]["scale"], 4))
+    assert r["occluded_hard"]["F"] > 0.97 and abs(r["align"]["scale"] - 1 / s) < 0.01 / s, r["align"]
 
     # 2. visible surface only
     G, _ = E.sample_mesh(np.asarray(mesh.vertices) @ w2c[:3, :3].T + w2c[:3, 3],
