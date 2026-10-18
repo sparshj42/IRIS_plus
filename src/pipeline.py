@@ -18,6 +18,7 @@ Models are loaded/freed in phases. Image-to-3D and NKSR run in pinned-env subpro
 
 import argparse
 import gc
+import json
 import os
 import pickle
 import sys
@@ -74,6 +75,14 @@ parser.add_argument("--stop_after_peeling", action="store_true",
 parser.add_argument("--vlm", default=None,
                     help="VLM model ID override (e.g. Qwen/Qwen3-VL-8B-Instruct for GPUs "
                          "with <24 GB VRAM; default: Qwen/Qwen3-VL-32B-Instruct)")
+parser.add_argument("--peel_order_seed", type=int, default=None,
+                    help="sample a random VALID topological order of the occlusion graph "
+                         "(every CORe edge respected) instead of nearest-first tie-breaking; "
+                         "different seeds give the alternative orders used for order-invariance")
+parser.add_argument("--inpaint_seed", type=int, default=None,
+                    help="seed the removal inpainter's noise per peel step (default: global seed)")
+parser.add_argument("--stop_after_vggt", action="store_true",
+                    help="exit after Phase C (VGGT point maps saved); for cheap pilot runs")
 args = parser.parse_args()
 
 # RGB-D mode: derive sparse metric points from the dense --depth so the existing
@@ -427,7 +436,8 @@ def recover_metric_scale(depth_rel: np.ndarray, sparse_path: str) -> np.ndarray:
     return s * depth_rel + t
 
 
-def build_occlusion_order(instances, depth_map, band_px=6, margin_frac=0.04):
+def build_occlusion_order(instances, depth_map, band_px=6, margin_frac=0.04, rng=None,
+                          return_graph=False):
     """Front-to-back peel order via a pairwise occlusion graph + topological sort.
 
     Peeling must remove an occluder *before* what it hides, so the ordering
@@ -444,11 +454,17 @@ def build_occlusion_order(instances, depth_map, band_px=6, margin_frac=0.04):
     sort then yields the peel order; cycles from boundary noise are broken at
     their weakest (smallest-margin) edge.
 
-    Returns instances reordered front (peel first) → back.
+    With rng, free choices among available nodes are made at random instead of
+    nearest-first, so different seeds enumerate different orders that all respect
+    every kept edge.
+
+    Returns instances reordered front (peel first) → back; with return_graph, also
+    the edge list [(occluder uid, occluded uid, weight)] as built (before cycle
+    breaking) and the list of edges dropped to break cycles.
     """
     n = len(instances)
     if n <= 1:
-        return list(instances)
+        return (list(instances), [], []) if return_graph else list(instances)
 
     H, W = depth_map.shape
     spread = float(np.percentile(depth_map, 95) - np.percentile(depth_map, 5)) + 1e-9
@@ -499,6 +515,10 @@ def build_occlusion_order(instances, depth_map, band_px=6, margin_frac=0.04):
                     print(f"    edge: {instances[occ]['uid']} -> {instances[hid]['uid']} "
                           f"({why}, w={w:.1f})")
 
+    graph = [(instances[a]["uid"], instances[b]["uid"], float(weight[(a, b)]))
+             for a in edges for b in edges[a]]
+    dropped = []
+
     # Kahn topological sort; ties + free choices broken by nearest-point disparity
     nearest = {i: inst["nearest"] for i, inst in enumerate(instances)}
     indeg = {i: 0 for i in range(n)}
@@ -518,13 +538,17 @@ def build_occlusion_order(instances, depth_map, band_px=6, margin_frac=0.04):
             else:
                 _, a, b = min(rem)
                 edges[a].discard(b)
+                dropped.append((instances[a]["uid"], instances[b]["uid"]))
                 indeg[b] -= 1
                 if indeg[b] == 0:
                     avail.append(b)
                 continue
-        # among available, peel the nearest (highest disparity) first
-        avail.sort(key=lambda i: nearest[i], reverse=True)
-        cur = avail.pop(0)
+        if rng is None:
+            # among available, peel the nearest (highest disparity) first
+            avail.sort(key=lambda i: nearest[i], reverse=True)
+            cur = avail.pop(0)
+        else:
+            cur = avail.pop(int(rng.integers(len(avail))))
         if cur in placed:
             continue
         order.append(cur)
@@ -534,7 +558,11 @@ def build_occlusion_order(instances, depth_map, band_px=6, margin_frac=0.04):
             if indeg[b] == 0 and b not in placed:
                 avail.append(b)
 
-    return [instances[i] for i in order]
+    ordered = [instances[i] for i in order]
+    return (ordered, graph, dropped) if return_graph else ordered
+
+
+_inpaint_calls = 0
 
 
 def remove_object(img: Image.Image, mask: np.ndarray) -> Image.Image:
@@ -565,12 +593,18 @@ def remove_object(img: Image.Image, mask: np.ndarray) -> Image.Image:
     crop_mask = Image.fromarray(mask_uint8[y0:y1, x0:x1])
     cw, ch = crop.size
 
+    global _inpaint_calls
+    gen = None
+    if args.inpaint_seed is not None:                 # per-step seed: (run seed, peel step)
+        gen = torch.Generator("cuda").manual_seed(args.inpaint_seed * 1000 + _inpaint_calls)
+    _inpaint_calls += 1
     result = rorem_pipe(
         prompt=ROREM_PROMPT, negative_prompt=ROREM_NEG_PROMPT,
         height=512, width=512,
         image=crop.resize((512, 512)),
         mask_image=crop_mask.resize((512, 512)),
         guidance_scale=1.0, num_inference_steps=25, strength=0.99,
+        generator=gen,
     ).images[0].resize((cw, ch), Image.LANCZOS)
 
     # Feathered composite of the inpainted crop region only
@@ -715,8 +749,23 @@ else:
             sorted_instances = sorted(instances, key=lambda inst: inst["nearest"], reverse=True)
             print("Peeling order (ABLATION: naive nearest-depth, NO topological sort):")
         else:
-            sorted_instances = build_occlusion_order(instances, depth_map)
-            print("Peeling order (occlusion graph + topological sort, front first):")
+            _rng = (np.random.default_rng(args.peel_order_seed)
+                    if args.peel_order_seed is not None else None)
+            sorted_instances, occ_graph, occ_dropped = build_occlusion_order(
+                instances, depth_map, rng=_rng, return_graph=True)
+            print("Peeling order (occlusion graph + topological sort, front first"
+                  + (f", random valid order seed {args.peel_order_seed}):" if _rng else "):"))
+            if img_idx == 0:
+                # graph + order for ordering evaluation and order-invariance analysis;
+                # masks are the ORIGINAL (pre-peel) instance masks in peel order
+                with open(os.path.join(OUTPUT_DIR, "peel_order.json"), "w") as f:
+                    json.dump({"order": [x["uid"] for x in sorted_instances],
+                               "edges": occ_graph, "dropped_for_cycles": occ_dropped,
+                               "peel_order_seed": args.peel_order_seed,
+                               "inpaint_seed": args.inpaint_seed}, f, indent=2)
+                np.savez_compressed(os.path.join(OUTPUT_DIR, "peel_order_masks.npz"),
+                                    masks=np.stack([x["mask"] > 0.5 for x in sorted_instances]),
+                                    uids=np.array([x["uid"] for x in sorted_instances]))
         for i, inst in enumerate(sorted_instances, 1):
             print(f"  {i}. {inst['uid']} (nearest-point disparity: {inst['nearest']:.3f})")
 
@@ -893,6 +942,10 @@ else:
                         metric_scale=metric_scale, view_paths=np.array(view_paths),
                         images_rgb=images_rgb)
     free_cuda(vggt, images_t, predictions)
+
+if args.stop_after_vggt:
+    print(f"\nStopped after VGGT (--stop_after_vggt). Point maps in {PM_PATH}")
+    sys.exit(0)
 
 V, Hv, Wv = conf.shape
 scene_mask = conf > VGGT_CONF_THRESHOLD
